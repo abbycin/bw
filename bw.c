@@ -101,11 +101,6 @@ void server(uint32_t dur, size_t size)
         };
         rdma_t *rdma = new_rdma();
 
-        if (!rdma) {
-                debug("new_rdam failed");
-                return;
-        }
-
         size_t memsize = size * (RX_DEPTH + TX_DEPTH);
         char *mem = NULL;
         int handle = -1;
@@ -245,8 +240,6 @@ out:
                 rdma->destroy_accp(acceptor);
         if (ctx)
                 rdma->exit(&ctx);
-        if (rdma)
-                free(rdma);
 }
 
 void client(uint32_t dur, size_t size, char *ip)
@@ -263,11 +256,6 @@ void client(uint32_t dur, size_t size, char *ip)
         };
 
         rdma_t *rdma = new_rdma();
-        if (!rdma) {
-                debug("new_rdma failed");
-                return;
-        }
-
         ctx_t *ctx = NULL;
         conn_t *conn = NULL;
         size_t memsize = size * (RX_DEPTH + TX_DEPTH);
@@ -400,8 +388,6 @@ out:
                 rdma->destroy_conn(conn);
         if (ctx)
                 rdma->exit(&ctx);
-        if (rdma)
-                free(rdma);
 }
 
 int main(int argc, char *argv[])

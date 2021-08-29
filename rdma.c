@@ -1130,29 +1130,26 @@ static inline int __impl_poll(conn_t *conn, struct ibv_wc *wc, int nwc)
 
 rdma_t *new_rdma()
 {
-	rdma_t *r = calloc(1, sizeof(rdma_t));
+	static rdma_t r = {
+		.init = __impl_init,
+		.exit = __impl_exit,
+		.regmr = __impl_regmr,
+		.setmr = __impl_setmr,
+		.server = __impl_server,
+		.listen = __impl_listen,
+		.accept = __impl_accept,
+		.client = __impl_client,
+		.connect = __impl_connect,
+		.connect_qp = __impl_connect_qp,
+		.send = __impl_send,
+		.recv = __impl_recv,
+		.poll = __impl_poll,
+		.destroy_conn = __impl_destroy_conn,
+		.destroy_accp = __impl_destroy_accp,
+		.is_connected = __impl_is_connected,
+		.local_addr = __impl_localinfo,
+		.remote_addr = __impl_peerinfo
+	};
 
-	if (!r)
-		return NULL;
-
-	r->init = __impl_init;
-	r->exit = __impl_exit;
-	r->regmr = __impl_regmr;
-	r->setmr = __impl_setmr;
-	r->server = __impl_server;
-	r->listen = __impl_listen;
-	r->accept = __impl_accept;
-	r->client = __impl_client;
-	r->connect = __impl_connect;
-	r->connect_qp = __impl_connect_qp;
-	r->send = __impl_send;
-	r->recv = __impl_recv;
-	r->poll = __impl_poll;
-	r->destroy_conn = __impl_destroy_conn;
-	r->destroy_accp = __impl_destroy_accp;
-	r->is_connected = __impl_is_connected;
-	r->local_addr = __impl_localinfo;
-	r->remote_addr = __impl_peerinfo;
-
-	return r;
+	return &r;
 }
