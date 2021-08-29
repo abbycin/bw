@@ -814,8 +814,6 @@ static int __impl_listen(accp_t *ctx)
 
 	flags = fcntl(ctx->listen_fd, F_GETFL);
 	fcntl(ctx->listen_fd, F_SETFL, flags | O_NONBLOCK);
-	flags = fcntl(ctx->verbs->async_fd, F_GETFL);
-	fcntl(ctx->verbs->async_fd, F_SETFL, flags | O_NONBLOCK);
 
 	return 0;
 }
@@ -924,8 +922,6 @@ static int __impl_client(struct ctx_t *z, cfg_t *cfg,  conn_t **conn)
 	memcpy(&tmp->cfg, cfg, sizeof(cfg_t));
 	srand48(getpid() * time(NULL));
 
-	flags = fcntl(tmp->verbs->async_fd, F_GETFL);
-	fcntl(tmp->verbs->async_fd, F_SETFL, flags | O_NONBLOCK);
 	flags = fcntl(tmp->sock, F_GETFL);
 	fcntl(tmp->sock, F_SETFL, flags | O_NONBLOCK);
 
