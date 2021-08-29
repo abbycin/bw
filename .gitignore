@@ -1,0 +1,11 @@
+.vscode
+*.o
+a.out
+build
+*.a
+*.so
+bw
+.swp
+*.~
+*.gch
+*.gcno
