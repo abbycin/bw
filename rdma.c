@@ -51,23 +51,10 @@
 	}                                                                      \
 	while (0)
 
-struct mr_ctx {
-	struct ibv_mr *mr;
-	int handle;
-	uint32_t ref;
-};
-
-struct mr_queue {
-	size_t cap;
-	size_t size;
-	struct mr_ctx *data;
-	pthread_mutex_t mtx;
-};
-
 struct ctx_t {
 	struct ibv_context *verbs;
 	struct ibv_pd *pd;
-	struct mr_queue *q;
+	struct ibv_mr *mr;
 };
 
 struct accp_t {
@@ -89,109 +76,8 @@ struct conn_t {
 	struct ibv_qp *qp;
 	accp_t *acceptor;
 	void *progress;
-	void *mr;
+	struct ibv_mr *mr;
 };
-
-#define __get_mr(x) (((struct mr_ctx *)x->mr)->mr)
-
-static struct mr_queue *__init_queue(void)
-{
-	struct mr_queue *q = calloc(1, sizeof(struct mr_queue));
-
-	q->cap = 1024;
-	q->size = 0;
-	q->data = calloc(q->cap, sizeof(*q->data));
-	pthread_mutex_init(&q->mtx, NULL);
-	return q;
-}
-
-static int __destroy_queue(struct mr_queue *q)
-{
-	int rc = 0;
-
-	if (q) {
-		for (size_t i = 0; i < q->size; ++i) {
-			if (q->data[i].mr) {
-				rc = ibv_dereg_mr(q->data[i].mr);
-				if (rc) {
-					errno = rc > 0 ? rc : -rc;
-					return -1;
-				}
-				q->data[i].mr = NULL;
-			}
-		}
-		free(q->data);
-		free(q);
-	}
-	return rc;
-}
-
-static void __pushq(struct mr_queue *q, struct ibv_mr *mr, int *handle)
-{
-	assert(q);
-	pthread_mutex_lock(&q->mtx);
-	if (q->size + 1 == q->cap) {
-		q->cap *= 2;
-
-		size_t len = sizeof(struct mr_ctx);
-		struct mr_ctx *tmp = calloc(q->cap, len);
-
-		memcpy(tmp, q->data, q->size * len);
-		free(q->data);
-		q->data = tmp;
-	}
-	q->data[q->size].handle = *handle;
-	q->data[q->size].mr = mr;
-	// not set to 1, since it only incr by calling `__impl_setmr`
-	// and decr by calling `__impl_deregmr`
-	q->data[q->size].ref = 0;
-	*handle = q->size;
-	q->size += 1;
-	pthread_mutex_unlock(&q->mtx);
-}
-
-static void __shareq(struct mr_queue *q, struct mr_ctx **ctx, uint32_t handle)
-{
-	assert(q);
-	pthread_mutex_lock(&q->mtx);
-	*ctx = &q->data[handle];
-	(*ctx)->handle = handle;
-	q->data[handle].ref += 1;
-	pthread_mutex_unlock(&q->mtx);
-}
-
-static int __nullq(struct mr_queue *q, uint32_t handle)
-{
-	int rc = 0;
-
-	assert(q);
-	pthread_mutex_lock(&q->mtx);
-	if (q->data[handle].mr) {
-		rc = ibv_dereg_mr(q->data[handle].mr);
-		q->data[handle].mr = NULL;
-	}
-	pthread_mutex_unlock(&q->mtx);
-	if (rc > 0) {
-		errno = rc;
-		rc = -1;
-	}
-	return rc;
-}
-
-static int __unshareq(struct mr_queue *q, uint32_t handle)
-{
-	int ref = -1;
-
-	pthread_mutex_lock(&q->mtx);
-	if (q->data[handle].mr && q->data[handle].ref) {
-		q->data[handle].ref -= 1;
-		ref = q->data[handle].ref;
-	}
-	pthread_mutex_unlock(&q->mtx);
-	if (ref < 0)
-		err("unexpect ref, find bug in your code!");
-	return ref;
-}
 
 static int __poll_ev(int fd, int count, int timeout)
 {
@@ -299,6 +185,7 @@ static int __create_socket(bool is_server, const char *host, const char *port)
 	struct addrinfo *result = NULL;
 	int sockfd = -1;
 	int option = 1;
+	int rc;
 
 	errno = 0;
 	bzero(&hints, sizeof(struct addrinfo));
@@ -310,7 +197,11 @@ static int __create_socket(bool is_server, const char *host, const char *port)
 	if (is_server)
 		hints.ai_flags = AI_PASSIVE;
 
-	getaddrinfo(host, port, &hints, &result);
+	rc = getaddrinfo(host, port, &hints, &result);
+	if (rc != 0) {
+		err("getaddrinfo: %s\n", gai_strerror(rc));
+		return -1;
+	}
 
 	for (current = result; current != NULL; current = current->ai_next) {
 		sockfd = socket(current->ai_family,
@@ -584,7 +475,6 @@ static int __impl_init(struct ctx_t **ctx)
 	}
 
 	ibv_free_device_list(devs);
-	(*ctx)->q = __init_queue();
 
 	return 0;
 failed:
@@ -603,11 +493,15 @@ static int __impl_exit(struct ctx_t **ctx)
 {
 	int rc = 0;
 
-	rc = __destroy_queue((*ctx)->q);
-	if (rc) {
-		err("ibv_dereg_mr");
-		return -1;
+	if ((*ctx)->mr) {
+		rc = ibv_dereg_mr((*ctx)->mr);
+		if (rc) {
+			errno = rc > 0 ? rc : -rc;
+			err("ibv_dereg_mr");
+			goto failed;
+		}
 	}
+
 	if ((*ctx)->pd) {
 		rc = ibv_dealloc_pd((*ctx)->pd);
 		if (rc) {
@@ -725,17 +619,9 @@ static inline int __impl_peerinfo(conn_t *ctx, addr_t *res)
 	return __impl_addrinfo(ctx, res, false);
 }
 
-static int __impl_regmr(ctx_t *ctx, void *addr, size_t len, int *handle)
+static int __impl_regmr(ctx_t *ctx, void *addr, size_t len)
 {
-	assert(handle);
-	if (!handle) {
-		errno = EINVAL;
-		err("handle can't be NULL");
-		return -1;
-	}
-
-	*handle = UINT32_MAX;
-
+	assert(!ctx->mr);
 	struct ibv_mr *mr = NULL;
 
 	// Send op requires only LOCAL_WRITE
@@ -745,44 +631,14 @@ static int __impl_regmr(ctx_t *ctx, void *addr, size_t len, int *handle)
 		return -1;
 	}
 
-	__pushq(ctx->q, mr, handle);
+	ctx->mr = mr;
 	return 0;
 }
 
-static int __impl_unsetmr(struct ctx_t *ctx, conn_t *con)
+static void __impl_setmr(struct ctx_t *ctx, conn_t *con)
 {
-	struct mr_ctx *mr = con->mr;
-
-	if (!mr || mr->handle < 0)
-		return -1;
-
-	int rc = -1;
-	int ref = __unshareq(ctx->q, mr->handle);
-
-	if (ref < 0)
-		return -1;
-	if (ref == 0)
-		rc = __nullq(ctx->q, mr->handle);
-	else
-		return 0; // still in use
-	return rc == 0 ? 1 : -1;
-}
-
-static int __impl_setmr(struct ctx_t *ctx, conn_t *con, int handle)
-{
-	int rc = 0;
-
-	if (handle < 0) {
-		errno = EINVAL;
-		err("invalid handle");
-		return -1;
-	}
-	if (con->mr)
-		rc = __impl_unsetmr(ctx, con);
-	if (rc < 0)
-		return rc;
-	__shareq(ctx->q, (struct mr_ctx **)&con->mr, handle);
-	return 0;
+	assert(ctx->mr);
+	con->mr = ctx->mr;
 }
 
 static accp_t *__impl_server(ctx_t *z, cfg_t *cfg)
@@ -1096,7 +952,7 @@ static int __impl_send(conn_t *ctx, struct iovec *iov, int n, void *data)
 	for (int i = 0; i < n; ++i) {
 		sgl[i].addr = (uint64_t)iov[i].iov_base;
 		sgl[i].length = iov[i].iov_len;
-		sgl[i].lkey = __get_mr(ctx)->lkey;
+		sgl[i].lkey = ctx->mr->lkey;
 	}
 
 	bzero(&wr, sizeof(wr));
@@ -1128,7 +984,7 @@ static int __impl_recv(conn_t *ctx, struct iovec *iov, int n, void *data)
 	for (int i = 0; i < n; ++i) {
 		sgl[i].addr = (uint64_t)iov[i].iov_base;
 		sgl[i].length = iov[i].iov_len;
-		sgl[i].lkey = __get_mr(ctx)->lkey;
+		sgl[i].lkey = ctx->mr->lkey;
 	}
 
 	bzero(&wr, sizeof(wr));

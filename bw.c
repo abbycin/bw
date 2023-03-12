@@ -130,7 +130,6 @@ void server(uint32_t dur, size_t size)
 
 	size_t memsize = size * (RX_DEPTH + TX_DEPTH);
 	char *mem = NULL;
-	int handle = -1;
 	struct timeval b;
 	struct ibv_wc wc[POLL_SZ];
 	int n = 0;
@@ -159,7 +158,7 @@ void server(uint32_t dur, size_t size)
 	}
 	txmem = mem + size * RX_DEPTH;
 
-	rc = rdma->regmr(ctx, mem, memsize, &handle);
+	rc = rdma->regmr(ctx, mem, memsize);
 	if (rc) {
 		debug("regmr failed");
 		goto out;
@@ -196,11 +195,7 @@ void server(uint32_t dur, size_t size)
 	while (rc == 0);
 
 	printf(" connected.\n");
-	rc = rdma->setmr(ctx, conn, handle);
-	if (rc) {
-		debug("setmr failed");
-		goto out;
-	}
+	rdma->setmr(ctx, conn);
 
 	for (int i = 0; i < RX_DEPTH; ++i) {
 		rx_ctx[i].iov_base = mem + size * i;
@@ -291,7 +286,6 @@ void client(uint32_t dur, size_t size, char *ip)
 	conn_t *conn = NULL;
 	size_t memsize = size * (RX_DEPTH + TX_DEPTH);
 	char *mem = NULL;
-	int handle = -1;
 	struct timeval b;
 	char *txmem = NULL;
 	struct ibv_wc wc[POLL_SZ];
@@ -320,7 +314,7 @@ void client(uint32_t dur, size_t size, char *ip)
 	}
 	txmem = mem + size * RX_DEPTH;
 
-	rc = rdma->regmr(ctx, mem, memsize, &handle);
+	rc = rdma->regmr(ctx, mem, memsize);
 	if (rc) {
 		debug("regmr failed");
 		goto out;
@@ -348,11 +342,7 @@ void client(uint32_t dur, size_t size, char *ip)
 	while (rc == 0);
 
 	printf(" connected.\n");
-	rc = rdma->setmr(ctx, conn, handle);
-	if (rc) {
-		debug("setmr failed");
-		goto out;
-	}
+	rdma->setmr(ctx, conn);
 
 	for (int i = 0; i < RX_DEPTH; ++i) {
 		rx_ctx[i].iov_base = mem + size * i;

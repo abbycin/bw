@@ -6,7 +6,7 @@
 **********************************************************/
 
 #ifndef NM_RDMA_H_
-#define MM_RDMA_H_
+#define NM_RDMA_H_
 
 #include <stdbool.h>
 #include <infiniband/verbs.h>
@@ -42,8 +42,8 @@ typedef struct ctx_t ctx_t;
 typedef struct {
 	int (*init)(ctx_t **ctx);
 	int (*exit)(ctx_t **ctx);
-	int (*regmr)(ctx_t *ctx, void *addr, size_t len, int *hdl);
-	int (*setmr)(ctx_t *ctx, conn_t *con, int hdl);
+	int (*regmr)(ctx_t *ctx, void *addr, size_t len);
+	void (*setmr)(ctx_t *ctx, conn_t *con);
 	accp_t *(*server)(ctx_t *ctx, cfg_t *cfg);
 	int (*listen)(accp_t *a);
 	int (*accept)(accp_t *a, conn_t **con);
