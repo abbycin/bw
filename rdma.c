@@ -1,8 +1,8 @@
 /*********************************************************
-        ┊ File Name:rdma.c
-        ┊ Author: Abby Cin
-        ┊ Mail: abbytsing@gmail.com
-        ┊ Created Time: Sun 29 Aug 2021 12:01:14 PM CST
+	┊ File Name:rdma.c
+	┊ Author: Abby Cin
+	┊ Mail: abbytsing@gmail.com
+	┊ Created Time: Sun 29 Aug 2021 12:01:14 PM CST
 **********************************************************/
 
 #include "rdma.h"
@@ -21,22 +21,35 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef MULTI_SGE
 #define MAX_SGE_NUM 31
 #define MAX_SRQ_SGL 27
+#else
+#define MAX_SGE_NUM 1
+#define MAX_SRQ_SGL 1
+#endif
 
 #define __min__(x, y) ((x) > (y) ? (y) : (x))
 
-#define err(fmt, ...) \
-	fprintf(stderr, "[rdma] %s:%d (code %d) " fmt "\n", \
-		__FILE__, __LINE__, errno, ##__VA_ARGS__)
+#define err(fmt, ...)                                                          \
+	fprintf(stderr,                                                        \
+		"[rdma] %s:%d (code %d) " fmt "\n",                            \
+		__FILE__,                                                      \
+		__LINE__,                                                      \
+		errno,                                                         \
+		##__VA_ARGS__)
 
-#define oops(x) \
-	do { \
-		if ((x)) { \
-			fprintf(stderr, "[rdma] %s:%d (code %d)\n", __func__, \
-				__LINE__, (x)); \
-		} \
-	} while (0)
+#define oops(x)                                                                \
+	do {                                                                   \
+		if ((x)) {                                                     \
+			fprintf(stderr,                                        \
+				"[rdma] %s:%d (code %d)\n",                    \
+				__func__,                                      \
+				__LINE__,                                      \
+				(x));                                          \
+		}                                                              \
+	}                                                                      \
+	while (0)
 
 struct mr_ctx {
 	struct ibv_mr *mr;
@@ -192,7 +205,8 @@ static int __poll_ev(int fd, int count, int timeout)
 			continue;
 		}
 		break;
-	} while (count > 0);
+	}
+	while (count > 0);
 	return res;
 }
 
@@ -220,7 +234,8 @@ static void __str2gid(const char *data, union ibv_gid *gid)
 }
 
 // prefer RoCE v2
-static int __get_gid_index(struct ibv_context *ctx, struct ibv_port_attr *attr,
+static int __get_gid_index(struct ibv_context *ctx,
+			   struct ibv_port_attr *attr,
 			   int ib_port)
 {
 	int index = 0;
@@ -262,7 +277,12 @@ struct qp_token {
 	char gid_str[33];
 };
 
-enum conn_status { QP_INIT, QP_RTS, QP_VALIDATE, QP_DONE };
+enum conn_status {
+	QP_INIT,
+	QP_RTS,
+	QP_VALIDATE,
+	QP_DONE
+};
 
 struct conn_progress {
 	enum conn_status status;
@@ -293,14 +313,18 @@ static int __create_socket(bool is_server, const char *host, const char *port)
 	getaddrinfo(host, port, &hints, &result);
 
 	for (current = result; current != NULL; current = current->ai_next) {
-		sockfd = socket(current->ai_family, current->ai_socktype,
+		sockfd = socket(current->ai_family,
+				current->ai_socktype,
 				current->ai_protocol);
 		if (sockfd == -1) {
 			err("socket");
 			continue;
 		}
 
-		if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &option,
+		if (setsockopt(sockfd,
+			       SOL_SOCKET,
+			       SO_REUSEADDR,
+			       &option,
 			       sizeof(option)) == -1) {
 			close(sockfd);
 			freeaddrinfo(result);
@@ -308,11 +332,13 @@ static int __create_socket(bool is_server, const char *host, const char *port)
 			return -1;
 		}
 		if (is_server) {
-			if (bind(sockfd, current->ai_addr,
+			if (bind(sockfd,
+				 current->ai_addr,
 				 current->ai_addrlen) == 0)
 				break;
 		} else {
-			if (connect(sockfd, current->ai_addr,
+			if (connect(sockfd,
+				    current->ai_addr,
 				    current->ai_addrlen) == 0)
 				break;
 		}
@@ -321,7 +347,10 @@ static int __create_socket(bool is_server, const char *host, const char *port)
 	}
 
 	if (sockfd > 0)
-		setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &option,
+		setsockopt(sockfd,
+			   IPPROTO_TCP,
+			   TCP_NODELAY,
+			   &option,
 			   sizeof(option));
 	freeaddrinfo(result);
 	return sockfd;
@@ -331,7 +360,7 @@ static int __qp_init(struct ibv_qp *qp, uint8_t port)
 {
 	struct ibv_qp_attr attr;
 	int flags = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
-		    IBV_QP_ACCESS_FLAGS;
+		IBV_QP_ACCESS_FLAGS;
 
 	bzero(&attr, sizeof(attr));
 	attr.qp_state = IBV_QPS_INIT;
@@ -341,19 +370,19 @@ static int __qp_init(struct ibv_qp *qp, uint8_t port)
 	return ibv_modify_qp(qp, &attr, flags);
 }
 
-static int __qp_rtr(struct ibv_qp *qp, struct qp_token *token, uint8_t sgidx,
-		    int ib_port)
+static int
+__qp_rtr(struct ibv_qp *qp, struct qp_token *token, uint8_t sgidx, int ib_port)
 {
 	struct ibv_qp_attr attr;
 	int flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
-		    IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
-		    IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+		IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
+		IBV_QP_MIN_RNR_TIMER;
 
 	bzero(&attr, sizeof(attr));
 	attr.qp_state = IBV_QPS_RTR;
 	attr.path_mtu = IBV_MTU_4096;
 	attr.dest_qp_num = token->qpn;
-	attr.rq_psn = 0; //token->psn; // peer seq number
+	attr.rq_psn = 0; // token->psn; // peer seq number
 	attr.max_dest_rd_atomic = 1;
 	attr.min_rnr_timer = 12;
 	attr.ah_attr.is_global = 0;
@@ -376,7 +405,7 @@ static int __qp_rts(struct ibv_qp *qp, struct qp_token *token)
 {
 	struct ibv_qp_attr attr;
 	int flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
-		    IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
+		IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
 
 	bzero(&attr, sizeof(attr));
 	attr.qp_state = IBV_QPS_RTS;
@@ -385,7 +414,7 @@ static int __qp_rts(struct ibv_qp *qp, struct qp_token *token)
 	attr.retry_cnt = 7;
 	attr.rnr_retry = 7;
 	(void)token;
-	attr.sq_psn = 0; //token->psn; // self seq number
+	attr.sq_psn = 0; // token->psn; // self seq number
 	attr.max_rd_atomic = 1;
 
 	return ibv_modify_qp(qp, &attr, flags);
@@ -411,7 +440,9 @@ static int __send_token(conn_t *ctx, struct conn_progress *p)
 	if (p->src_gid_idx < 0) {
 		fprintf(stderr,
 			"rdma %s:%d => can't get gid index of ib_port: %d\n",
-			__func__, __LINE__, ib_port);
+			__func__,
+			__LINE__,
+			ib_port);
 		return -1;
 	}
 
@@ -497,8 +528,9 @@ static int __validate_token(conn_t *ctx)
 		rc = read(ctx->sock, qpn + p->offset, size - p->offset);
 		if (rc < 0) {
 			if (errno != EAGAIN && errno != EWOULDBLOCK) {
-				err("fd: %d, error: %s", ctx->sock,
-					strerror(errno));
+				err("fd: %d, error: %s",
+				    ctx->sock,
+				    strerror(errno));
 				return -1;
 			}
 			return 0;
@@ -693,7 +725,6 @@ static inline int __impl_peerinfo(conn_t *ctx, addr_t *res)
 	return __impl_addrinfo(ctx, res, false);
 }
 
-
 static int __impl_regmr(ctx_t *ctx, void *addr, size_t len, int *handle)
 {
 	assert(handle);
@@ -737,7 +768,7 @@ static int __impl_unsetmr(struct ctx_t *ctx, conn_t *con)
 	return rc == 0 ? 1 : -1;
 }
 
-static int __impl_setmr(struct ctx_t *ctx, conn_t *con,	int handle)
+static int __impl_setmr(struct ctx_t *ctx, conn_t *con, int handle)
 {
 	int rc = 0;
 
@@ -890,7 +921,7 @@ failed:
 	return res;
 }
 
-static int __impl_client(struct ctx_t *z, cfg_t *cfg,  conn_t **conn)
+static int __impl_client(struct ctx_t *z, cfg_t *cfg, conn_t **conn)
 {
 	int res = -1;
 	int flags = 0;
@@ -1126,26 +1157,24 @@ static inline int __impl_poll(conn_t *conn, struct ibv_wc *wc, int nwc)
 
 rdma_t *new_rdma()
 {
-	static rdma_t r = {
-		.init = __impl_init,
-		.exit = __impl_exit,
-		.regmr = __impl_regmr,
-		.setmr = __impl_setmr,
-		.server = __impl_server,
-		.listen = __impl_listen,
-		.accept = __impl_accept,
-		.client = __impl_client,
-		.connect = __impl_connect,
-		.connect_qp = __impl_connect_qp,
-		.send = __impl_send,
-		.recv = __impl_recv,
-		.poll = __impl_poll,
-		.destroy_conn = __impl_destroy_conn,
-		.destroy_accp = __impl_destroy_accp,
-		.is_connected = __impl_is_connected,
-		.local_addr = __impl_localinfo,
-		.remote_addr = __impl_peerinfo
-	};
+	static rdma_t r = { .init = __impl_init,
+			    .exit = __impl_exit,
+			    .regmr = __impl_regmr,
+			    .setmr = __impl_setmr,
+			    .server = __impl_server,
+			    .listen = __impl_listen,
+			    .accept = __impl_accept,
+			    .client = __impl_client,
+			    .connect = __impl_connect,
+			    .connect_qp = __impl_connect_qp,
+			    .send = __impl_send,
+			    .recv = __impl_recv,
+			    .poll = __impl_poll,
+			    .destroy_conn = __impl_destroy_conn,
+			    .destroy_accp = __impl_destroy_accp,
+			    .is_connected = __impl_is_connected,
+			    .local_addr = __impl_localinfo,
+			    .remote_addr = __impl_peerinfo };
 
 	return &r;
 }
