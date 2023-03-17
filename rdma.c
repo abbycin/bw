@@ -6,16 +6,19 @@
 **********************************************************/
 
 #include "rdma.h"
+#include <rdma/rdma_verbs.h>
 #include <assert.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <sys/time.h>
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <netdb.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,69 +35,19 @@
 #define __min__(x, y) ((x) > (y) ? (y) : (x))
 
 #define err(fmt, ...)                                                          \
-	fprintf(stderr,                                                        \
-		"[rdma] %s:%d (code %d) " fmt "\n",                            \
-		__FILE__,                                                      \
-		__LINE__,                                                      \
-		errno,                                                         \
-		##__VA_ARGS__)
+	fprintf(stderr, "%s:%d " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__)
 
 #define oops(x)                                                                \
 	do {                                                                   \
 		if ((x)) {                                                     \
 			fprintf(stderr,                                        \
-				"[rdma] %s:%d (code %d)\n",                    \
+				"%s:%d (code %d)\n",                           \
 				__func__,                                      \
 				__LINE__,                                      \
 				(x));                                          \
 		}                                                              \
 	}                                                                      \
 	while (0)
-
-struct ctx_t {
-	struct ibv_context *verbs;
-	struct ibv_pd *pd;
-	struct ibv_mr *mr;
-};
-
-struct accp_t {
-	int listen_fd;
-	cfg_t cfg;
-	struct ibv_context *verbs;
-	struct ibv_pd *pd;
-	struct ibv_srq *srq;
-};
-
-struct conn_t {
-	bool connected;
-	int sock;
-	uint32_t qp_num;
-	cfg_t cfg;
-	struct ibv_context *verbs;
-	struct ibv_pd *pd;
-	struct ibv_cq *cq;
-	struct ibv_qp *qp;
-	accp_t *acceptor;
-	void *progress;
-	struct ibv_mr *mr;
-};
-
-static int __poll_ev(int fd, int count, int timeout)
-{
-	struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
-	int res = 0;
-
-	do {
-		res = poll(&pfd, 1, timeout);
-		if (res == 0) {
-			count -= 1;
-			continue;
-		}
-		break;
-	}
-	while (count > 0);
-	return res;
-}
 
 static void __gid2str(union ibv_gid *gid, char *data)
 {
@@ -161,6 +114,7 @@ struct qp_token {
 	uint32_t psn;
 	union ibv_gid gid;
 	char gid_str[33];
+	int dev;
 };
 
 enum conn_status {
@@ -178,11 +132,15 @@ struct conn_progress {
 	struct qp_token peer;
 };
 
-static int __create_socket(bool is_server, const char *host, const char *port)
+static int __create_socket(bool is_server,
+			   const char *host,
+			   const char *local,
+			   const char *port)
 {
 	struct addrinfo *current = NULL;
 	struct addrinfo hints;
 	struct addrinfo *result = NULL;
+	struct sockaddr_in addr = { 0 };
 	int sockfd = -1;
 	int option = 1;
 	int rc;
@@ -228,6 +186,16 @@ static int __create_socket(bool is_server, const char *host, const char *port)
 				 current->ai_addrlen) == 0)
 				break;
 		} else {
+			inet_pton(AF_INET, local, &addr.sin_addr);
+			addr.sin_port = 0;
+			addr.sin_family = AF_INET;
+			rc = bind(
+				sockfd, (struct sockaddr *)&addr, sizeof(addr));
+			if (rc) {
+				err("bind rc %d errno %d", rc, errno);
+				close(sockfd);
+				return -1;
+			}
 			if (connect(sockfd,
 				    current->ai_addr,
 				    current->ai_addrlen) == 0)
@@ -345,6 +313,7 @@ static int __send_token(conn_t *ctx, struct conn_progress *p)
 	p->self.lid = htons(attr.lid);
 	p->self.psn = htonl(lrand48() & 0xffffff);
 	p->self.qpn = htonl(qp->qp_num);
+	p->self.dev = ctx->dev;
 
 	__gid2str(&p->self.gid, p->self.gid_str);
 	nbytes = write(sock, &p->self, size);
@@ -383,6 +352,7 @@ static int __recv_token(conn_t *ctx, struct conn_progress *p)
 		p->peer.lid = htons(p->peer.lid);
 		p->peer.psn = htonl(p->peer.psn);
 		p->peer.qpn = htonl(p->peer.qpn);
+		ctx->rdev = p->peer.dev;
 		__str2gid(p->peer.gid_str, &p->peer.gid);
 		if (__qp_init(ctx->qp, ib_port)) {
 			err("modify qp to init");
@@ -447,85 +417,206 @@ static int __validate_token(conn_t *ctx)
 	return 1;
 }
 
+static int build_map(ctx_t *z, char *ip, int tmo)
+{
+	struct rdma_cm_id *cm_id = NULL;
+	struct rdma_event_channel *ch = NULL;
+	struct rdma_cm_event *ev = NULL;
+	struct rdma_addrinfo *ai = NULL;
+	int rc = 0;
+
+	errno = 0;
+	rc = rdma_getaddrinfo(ip, NULL, NULL, &ai);
+	if (rc) {
+		err("rdma_getaddrinfo %s, rc %d errno %d", ip, rc, errno);
+		return -1;
+	}
+	ch = rdma_create_event_channel();
+	assert(ch);
+	rc = rdma_create_id(ch, &cm_id, NULL, RDMA_PS_TCP);
+	if (rc) {
+		err("rdma_create_id %s, rc %d errno %d", ip, rc, errno);
+		rc = -1;
+		goto err;
+	}
+
+	for (struct rdma_addrinfo *i = ai; i; i = i->ai_next) {
+		rc = rdma_resolve_addr(cm_id, NULL, i->ai_dst_addr, tmo);
+		if (rc) {
+			err("rdma_resolve_addr %s, rc %d errno %d",
+			    ip,
+			    rc,
+			    errno);
+			rc = -1;
+			goto err;
+		}
+		break;
+	}
+	if (rdma_get_cm_event(ch, &ev) == -1) {
+		err("rdma_get_cm_event %s, rc %d errno %d", ip, rc, errno);
+		rc = -1;
+		goto err;
+	}
+	if (ev->event != RDMA_CM_EVENT_ADDR_RESOLVED) {
+		// err("resolve addr fail %s, expect %s get %s", ip,
+		// 	rdma_event_str(RDMA_CM_EVENT_ADDR_RESOLVED),
+		// 	rdma_event_str(ev->event));
+		rdma_ack_cm_event(ev);
+		rc = -1;
+		goto err;
+	}
+	rdma_ack_cm_event(ev);
+
+	for (int i = 0; i < MAX_IB_DEV; ++i) {
+		if (!z->verbs[i])
+			continue;
+		if (z->verbs[i]->device == cm_id->verbs->device) {
+			err("%s => %d", ip, i);
+			z->map[i].dev = i;
+			bzero(z->map[i].ip, sizeof(z->map[i].ip));
+			memcpy(z->map[i].ip, ip, strlen(ip));
+			break;
+		}
+	}
+
+err:
+	if (ai)
+		rdma_freeaddrinfo(ai);
+	if (cm_id)
+		rdma_destroy_id(cm_id);
+	if (ch)
+		rdma_destroy_event_channel(ch);
+	return rc;
+}
+
+static int init_map(ctx_t *z)
+{
+	struct ifaddrs *ifaddr = NULL;
+	struct ifaddrs *addr = NULL;
+	int rc = 0;
+	char ip[NI_MAXHOST];
+	char buf[256] = { 0 };
+	FILE *fp = popen("ibdev2netdev 2>/dev/null", "r");
+
+	assert(fp);
+	rc = fread(buf, sizeof(buf), 1, fp);
+	rc = getifaddrs(&ifaddr);
+	if (rc) {
+		err("getifaddr rc %d errno %d", rc, errno);
+		return 1;
+	}
+
+	addr = ifaddr;
+	while (addr) {
+		if (!addr->ifa_addr || addr->ifa_addr->sa_family != AF_INET)
+			goto next;
+
+		bzero(ip, sizeof(ip));
+		rc = getnameinfo(addr->ifa_addr,
+				 sizeof(struct sockaddr_in),
+				 ip,
+				 sizeof(ip),
+				 NULL,
+				 0,
+				 NI_NUMERICHOST);
+		if (rc != 0) {
+			err("getnameinfo %s\n", gai_strerror(rc));
+			goto err;
+		}
+		if (strstr(buf, addr->ifa_name)) {
+			// err("%s => %s", addr->ifa_name, ip);
+			build_map(z, ip, 1000);
+		}
+	next:
+		addr = addr->ifa_next;
+	}
+
+	pclose(fp);
+	freeifaddrs(ifaddr);
+	return 0;
+err:
+	pclose(fp);
+	freeifaddrs(ifaddr);
+	return -1;
+}
+
 static int __impl_init(struct ctx_t **ctx)
 {
 	int num = 0;
 	struct ibv_device **devs = NULL;
+	struct ctx_t *z;
 
 	if (*ctx)
 		return 0;
 
-	*ctx = calloc(1, sizeof(struct ctx_t));
+	z = calloc(1, sizeof(struct ctx_t));
 	devs = ibv_get_device_list(&num);
 	if (num == 0) {
 		err("ibv_get_device_list");
 		goto failed;
 	}
 
-	(*ctx)->verbs = ibv_open_device(devs[0]);
-	if (!(*ctx)->verbs) {
-		err("ibv_open_device");
+	errno = 0;
+	if (num > MAX_IB_DEV)
+		num = MAX_IB_DEV;
+	for (int i = 0; i < num; ++i) {
+		z->verbs[i] = ibv_open_device(devs[i]);
+		if (!z->verbs[i]) {
+			err("ibv_open_device[%d] errno %d", i, errno);
+			continue;
+		}
+		z->nr_dev += 1;
+	}
+
+	if (z->nr_dev == 0) {
+		err("no IB device available");
 		goto failed;
 	}
 
-	(*ctx)->pd = ibv_alloc_pd((*ctx)->verbs);
-	if (!(*ctx)->pd) {
-		err("ibv_alloc_pd");
-		goto failed;
+	for (int i = 0; i < MAX_IB_DEV; ++i) {
+		if (!z->verbs[i])
+			continue;
+		z->pd[i] = ibv_alloc_pd(z->verbs[i]);
+		if (!z->pd[i]) {
+			err("ibv_alloc_pd errno %d", errno);
+			goto failed;
+		}
 	}
 
 	ibv_free_device_list(devs);
-
+	if (init_map(z))
+		goto failed;
+	*ctx = z;
 	return 0;
 failed:
 	if (devs)
 		ibv_free_device_list(devs);
-	if ((*ctx)->pd)
-		ibv_dealloc_pd((*ctx)->pd);
-	if ((*ctx)->verbs)
-		ibv_close_device((*ctx)->verbs);
-	free(*ctx);
-	*ctx = NULL;
+	for (int i = 0; i < MAX_IB_DEV; ++i) {
+		if (z->pd[i])
+			ibv_dealloc_pd(z->pd[i]);
+		if (z->verbs[i])
+			ibv_close_device(z->verbs[i]);
+	}
+	free(z);
 	return -1;
 }
 
 static int __impl_exit(struct ctx_t **ctx)
 {
-	int rc = 0;
+	struct ctx_t *z = *ctx;
 
-	if ((*ctx)->mr) {
-		rc = ibv_dereg_mr((*ctx)->mr);
-		if (rc) {
-			errno = rc > 0 ? rc : -rc;
-			err("ibv_dereg_mr");
-			goto failed;
-		}
+	for (int i = 0; i < MAX_IB_DEV; ++i) {
+		if (z->mr[i])
+			ibv_dereg_mr(z->mr[i]);
+		if (z->pd[i])
+			ibv_dealloc_pd(z->pd[i]);
+		if (z->verbs[i])
+			ibv_close_device(z->verbs[i]);
 	}
-
-	if ((*ctx)->pd) {
-		rc = ibv_dealloc_pd((*ctx)->pd);
-		if (rc) {
-			errno = rc > 0 ? rc : -rc;
-			err("ibv_dealloc_pd");
-			goto failed;
-		}
-		(*ctx)->pd = NULL;
-	}
-
-	if ((*ctx)->verbs) {
-		rc = ibv_close_device((*ctx)->verbs);
-		if (rc) {
-			err("ibv_close_device");
-			goto failed;
-		}
-		(*ctx)->verbs = NULL;
-	}
-	free(*ctx);
+	free(z);
 	*ctx = NULL;
 
 	return 0;
-failed:
-	return -1;
 }
 
 static int __validate_cfg(cfg_t *cfg)
@@ -545,7 +636,7 @@ static int __validate_cfg(cfg_t *cfg)
 		goto failed;
 	}
 
-	if (n < cfg->ib_dev) {
+	if (n < 1) {
 		err("ib_dev out of range");
 		res = -1;
 		goto failed;
@@ -565,7 +656,7 @@ static int __validate_cfg(cfg_t *cfg)
 		goto failed;
 	}
 
-	if (attr.phys_port_cnt < cfg->ib_port) {
+	if (attr.phys_port_cnt < 1) {
 		err("ib_port out of range");
 		res = -1;
 		goto failed;
@@ -588,7 +679,7 @@ failed:
 	return res;
 }
 
-static int __impl_addrinfo(conn_t *ctx, addr_t *res, bool local)
+static int __impl_addrinfo(int sock, addr_t *res, bool local)
 {
 	static __thread struct sockaddr_in addr;
 	static uint32_t size = sizeof(addr);
@@ -596,9 +687,9 @@ static int __impl_addrinfo(conn_t *ctx, addr_t *res, bool local)
 	int rc = 0;
 
 	if (local)
-		rc = getsockname(ctx->sock, (struct sockaddr *)&addr, &size);
+		rc = getsockname(sock, (struct sockaddr *)&addr, &size);
 	else
-		rc = getpeername(ctx->sock, (struct sockaddr *)&addr, &size);
+		rc = getpeername(sock, (struct sockaddr *)&addr, &size);
 
 	if (rc)
 		return rc;
@@ -611,34 +702,36 @@ static int __impl_addrinfo(conn_t *ctx, addr_t *res, bool local)
 
 static inline int __impl_localinfo(conn_t *ctx, addr_t *res)
 {
-	return __impl_addrinfo(ctx, res, true);
+	return __impl_addrinfo(ctx->sock, res, true);
 }
 
 static inline int __impl_peerinfo(conn_t *ctx, addr_t *res)
 {
-	return __impl_addrinfo(ctx, res, false);
+	return __impl_addrinfo(ctx->sock, res, false);
 }
 
 static int __impl_regmr(ctx_t *ctx, void *addr, size_t len)
 {
-	assert(!ctx->mr);
 	struct ibv_mr *mr = NULL;
 
 	// Send op requires only LOCAL_WRITE
-	mr = ibv_reg_mr(ctx->pd, addr, len, IBV_ACCESS_LOCAL_WRITE);
-	if (!mr) {
-		err("ibv_reg_mr");
-		return -1;
+	for (int i = 0; i < MAX_IB_DEV; ++i) {
+		if (!ctx->pd[i])
+			continue;
+		mr = ibv_reg_mr(ctx->pd[i], addr, len, IBV_ACCESS_LOCAL_WRITE);
+		if (!mr) {
+			err("ibv_reg_mr");
+			return -1;
+		}
+		ctx->mr[i] = mr;
 	}
-
-	ctx->mr = mr;
 	return 0;
 }
 
 static void __impl_setmr(struct ctx_t *ctx, conn_t *con)
 {
 	assert(ctx->mr);
-	con->mr = ctx->mr;
+	con->mr = ctx->mr[con->dev];
 }
 
 static accp_t *__impl_server(ctx_t *z, cfg_t *cfg)
@@ -651,24 +744,28 @@ static accp_t *__impl_server(ctx_t *z, cfg_t *cfg)
 	if (__validate_cfg(cfg))
 		return NULL;
 
-	assert(z->verbs && z->pd);
 	ctx = calloc(1, sizeof(accp_t));
-	ctx->verbs = z->verbs;
 	snprintf(port_s, sizeof(port_s), "%d", cfg->port);
-	res = __create_socket(true, cfg->ip, port_s);
+	res = __create_socket(true, cfg->ip, NULL, port_s);
 	if (res == -1) {
 		err("create_socket, ip:port => %s:%d", cfg->ip, cfg->port);
 		goto failed;
 	}
+	ctx->z = z;
 	ctx->listen_fd = res;
-	ctx->pd = z->pd;
-	bzero(&srq_attr, sizeof(srq_attr));
-	srq_attr.attr.max_wr = cfg->max_wr;
-	srq_attr.attr.max_sge = MAX_SRQ_SGL;
-	ctx->srq = ibv_create_srq(ctx->pd, &srq_attr);
-	if (!ctx->srq) {
-		err("ibv_create_srq");
-		goto failed;
+	if (cfg->use_srq) {
+		bzero(&srq_attr, sizeof(srq_attr));
+		srq_attr.attr.max_wr = cfg->max_wr;
+		srq_attr.attr.max_sge = MAX_SRQ_SGL;
+		for (int i = 0; i < MAX_IB_DEV; ++i) {
+			if (!z->pd[i])
+				continue;
+			ctx->srq[i] = ibv_create_srq(z->pd[i], &srq_attr);
+			if (!ctx->srq[i]) {
+				err("ibv_create_srq");
+				goto failed;
+			}
+		}
 	}
 
 	memcpy(&ctx->cfg, cfg, sizeof(cfg_t));
@@ -677,9 +774,6 @@ static accp_t *__impl_server(ctx_t *z, cfg_t *cfg)
 	return ctx;
 
 failed:
-	if (ctx->srq)
-		ibv_destroy_srq(ctx->srq);
-
 	if (ctx->listen_fd)
 		close(ctx->listen_fd);
 
@@ -705,6 +799,15 @@ static int __impl_listen(accp_t *ctx)
 	return 0;
 }
 
+static int get_dev(ctx_t *z, const char *ip)
+{
+	for (int i = 0; i < MAX_IB_DEV; ++i) {
+		if (strncmp(ip, z->map[i].ip, strlen(z->map[i].ip)) == 0)
+			return z->map[i].dev;
+	}
+	return -1;
+}
+
 static int __impl_accept(accp_t *ctx, conn_t **conn)
 {
 	int res = -1;
@@ -713,6 +816,7 @@ static int __impl_accept(accp_t *ctx, conn_t **conn)
 	struct ibv_qp_init_attr qp_attr;
 	struct conn_progress *prog = NULL;
 	addr_t peer;
+	int dev = 0;
 
 	res = accept(ctx->listen_fd, NULL, NULL);
 	if (res <= 0) {
@@ -722,28 +826,45 @@ static int __impl_accept(accp_t *ctx, conn_t **conn)
 		goto failed;
 	}
 
+	if (ctx->cfg.ib_dev > -1) {
+		dev = ctx->cfg.ib_dev;
+	} else {
+		__impl_addrinfo(res, &peer, true);
+		dev = get_dev(ctx->z, peer.ip);
+	}
+	assert(dev >= 0);
+
 	tmp = calloc(1, sizeof(conn_t));
 	memcpy(&tmp->cfg, &ctx->cfg, sizeof(cfg_t));
 	tmp->sock = res;
 	tmp->acceptor = ctx;
-	tmp->cq = ibv_create_cq(ctx->verbs, ctx->cfg.max_wr * 2, NULL, NULL, 0);
-	if (!tmp->cq) {
+	tmp->dev = dev;
+	tmp->send_cq = ibv_create_cq(
+		ctx->z->verbs[dev], ctx->cfg.max_wr * 2, NULL, NULL, 0);
+	if (!tmp->send_cq) {
 		err("ibv_create_cq");
 		goto failed;
 	}
-	tmp->verbs = ctx->verbs;
+	tmp->recv_cq = ibv_create_cq(
+		ctx->z->verbs[dev], ctx->cfg.max_wr * 2, NULL, NULL, 0);
+	if (!tmp->recv_cq) {
+		err("ibv_create_cq");
+		goto failed;
+	}
 	bzero(&qp_attr, sizeof(qp_attr));
 	qp_attr.qp_context = tmp;
 	qp_attr.qp_type = IBV_QPT_RC;
 	qp_attr.cap.max_send_wr = ctx->cfg.cap_send;
+	qp_attr.cap.max_recv_wr = ctx->cfg.cap_recv;
 	qp_attr.cap.max_send_sge = MAX_SGE_NUM;
 	qp_attr.cap.max_recv_sge = MAX_SGE_NUM;
 	qp_attr.cap.max_inline_data = 0;
-	qp_attr.recv_cq = tmp->cq;
-	qp_attr.srq = ctx->srq;
-	qp_attr.send_cq = tmp->cq;
+	qp_attr.recv_cq = tmp->recv_cq;
+	if (ctx->cfg.use_srq)
+		qp_attr.srq = ctx->srq[dev];
+	qp_attr.send_cq = tmp->send_cq;
 	qp_attr.sq_sig_all = 0;
-	tmp->qp = ibv_create_qp(ctx->pd, &qp_attr);
+	tmp->qp = ibv_create_qp(ctx->z->pd[dev], &qp_attr);
 	if (!tmp->qp) {
 		res = -1;
 		err("ibv_create_qp");
@@ -757,6 +878,8 @@ static int __impl_accept(accp_t *ctx, conn_t **conn)
 	prog = calloc(1, sizeof(*prog));
 	prog->status = QP_INIT;
 	tmp->progress = prog;
+	if (ctx->cfg.use_srq)
+		tmp->srq = ctx->srq[dev];
 	*conn = tmp;
 
 	bzero(&peer, sizeof(peer));
@@ -768,8 +891,10 @@ failed:
 	close(tmp->sock);
 	if (tmp->qp)
 		ibv_destroy_qp(tmp->qp);
-	if (tmp->cq)
-		ibv_destroy_cq(tmp->cq);
+	if (tmp->send_cq)
+		ibv_destroy_cq(tmp->send_cq);
+	if (tmp->recv_cq)
+		ibv_destroy_cq(tmp->recv_cq);
 
 	if (tmp)
 		free(tmp);
@@ -782,27 +907,39 @@ static int __impl_client(struct ctx_t *z, cfg_t *cfg, conn_t **conn)
 	int res = -1;
 	int flags = 0;
 	conn_t *tmp = NULL;
+	int dev = 0;
 	char port_s[6] = { 0 };
 
 	if (__validate_cfg(cfg))
 		return -1;
+	if (cfg->ib_dev > -1)
+		dev = cfg->ib_dev;
+	else
+		dev = get_dev(z, cfg->local_ip);
+	assert(dev >= 0);
 
-	assert(z->verbs && z->pd);
 	tmp = calloc(1, sizeof(conn_t));
-	tmp->verbs = z->verbs;
 
 	snprintf(port_s, sizeof(port_s), "%d", cfg->port);
-	res = __create_socket(false, cfg->ip, port_s);
+	res = __create_socket(false, cfg->ip, cfg->local_ip, port_s);
 	if (res == -1) {
 		err("create_socket, ip:port => %s:%d", cfg->ip, cfg->port);
 		goto failed;
 	}
 	tmp->sock = res;
 	res = -1;
-	tmp->pd = z->pd;
+	tmp->dev = dev;
+	tmp->pd = z->pd[dev];
 
-	tmp->cq = ibv_create_cq(tmp->verbs, cfg->max_wr * 2, NULL, NULL, 0);
-	if (!tmp->cq) {
+	tmp->send_cq =
+		ibv_create_cq(z->verbs[dev], cfg->max_wr * 2, NULL, NULL, 0);
+	if (!tmp->send_cq) {
+		err("ibv_create_cq");
+		goto failed;
+	}
+	tmp->recv_cq =
+		ibv_create_cq(z->verbs[dev], cfg->max_wr * 2, NULL, NULL, 0);
+	if (!tmp->recv_cq) {
 		err("ibv_create_cq");
 		goto failed;
 	}
@@ -817,8 +954,10 @@ static int __impl_client(struct ctx_t *z, cfg_t *cfg, conn_t **conn)
 	return 0;
 
 failed:
-	if (tmp->cq)
-		ibv_destroy_cq(tmp->cq);
+	if (tmp->send_cq)
+		ibv_destroy_cq(tmp->send_cq);
+	if (tmp->recv_cq)
+		ibv_destroy_cq(tmp->recv_cq);
 
 	if (tmp->sock)
 		close(tmp->sock);
@@ -843,8 +982,8 @@ static int __impl_connect(conn_t *ctx)
 	qp_attr.cap.max_send_sge = MAX_SGE_NUM;
 	qp_attr.cap.max_recv_sge = MAX_SGE_NUM;
 	qp_attr.cap.max_inline_data = 0;
-	qp_attr.recv_cq = ctx->cq;
-	qp_attr.send_cq = ctx->cq;
+	qp_attr.recv_cq = ctx->recv_cq;
+	qp_attr.send_cq = ctx->send_cq;
 	qp_attr.sq_sig_all = 0;
 
 	ctx->qp = ibv_create_qp(ctx->pd, &qp_attr);
@@ -904,17 +1043,11 @@ static int __impl_connect_qp(conn_t *ctx)
 		break;
 	case QP_DONE:
 		res = 1;
+		close(ctx->sock);
+		ctx->sock = -1;
 		break;
 	}
 	return res;
-}
-
-static bool __impl_is_connected(conn_t *ctx)
-{
-	if (!ctx->connected)
-		return false;
-
-	return __poll_ev(ctx->sock, 0, 0) == 0;
 }
 
 static void __impl_destroy_conn(conn_t *ctx)
@@ -925,23 +1058,28 @@ static void __impl_destroy_conn(conn_t *ctx)
 	if (ctx->qp)
 		ibv_destroy_qp(ctx->qp);
 
-	close(ctx->sock);
+	if (ctx->sock > 0)
+		close(ctx->sock);
 
-	if (ctx->cq)
-		oops(ibv_destroy_cq(ctx->cq));
+	if (ctx->send_cq)
+		oops(ibv_destroy_cq(ctx->send_cq));
+	if (ctx->recv_cq)
+		oops(ibv_destroy_cq(ctx->recv_cq));
 	free(ctx);
 }
 
 static void __impl_destroy_accp(accp_t *ctx)
 {
 	close(ctx->listen_fd);
-	if (ctx->srq)
-		oops(ibv_destroy_srq(ctx->srq));
-
+	for (int i = 0; i < MAX_IB_DEV; ++i) {
+		if (ctx->srq[i])
+			oops(ibv_destroy_srq(ctx->srq[i]));
+	}
 	free(ctx);
 }
 
-static int __impl_send(conn_t *ctx, struct iovec *iov, int n, void *data)
+static int
+__impl_send(conn_t *ctx, struct iovec *iov, int n, void *data, bool notify)
 {
 	int rc = 0;
 	static __thread struct ibv_sge sgl[MAX_SGE_NUM];
@@ -957,7 +1095,7 @@ static int __impl_send(conn_t *ctx, struct iovec *iov, int n, void *data)
 
 	bzero(&wr, sizeof(wr));
 	wr.opcode = IBV_WR_SEND;
-	wr.send_flags = IBV_SEND_SIGNALED;
+	wr.send_flags = notify ? IBV_SEND_SIGNALED : 0;
 	wr.sg_list = sgl;
 	wr.num_sge = n;
 	wr.next = NULL;
@@ -993,44 +1131,51 @@ static int __impl_recv(conn_t *ctx, struct iovec *iov, int n, void *data)
 	wr.sg_list = sgl;
 	wr.wr_id = (uint64_t)data;
 
-	if (ctx->acceptor)
-		rc = ibv_post_srq_recv(ctx->acceptor->srq, &wr, &bad_wr);
+	if (ctx->srq)
+		rc = ibv_post_srq_recv(ctx->srq, &wr, &bad_wr);
 	else
 		rc = ibv_post_recv(ctx->qp, &wr, &bad_wr);
 
 	if (rc) {
 		errno = rc > 0 ? rc : -rc;
-		err("ibv_post_recv");
+		err("ibv_post_recv srq %p", ctx->srq);
 		return -1;
 	}
 	return 0;
 }
 
-static inline int __impl_poll(conn_t *conn, struct ibv_wc *wc, int nwc)
+static inline int __impl_poll_send(conn_t *conn, struct ibv_wc *wc, int nwc)
 {
-	return ibv_poll_cq(conn->cq, nwc, wc);
+	return ibv_poll_cq(conn->send_cq, nwc, wc);
+}
+
+static inline int __impl_poll_recv(conn_t *conn, struct ibv_wc *wc, int nwc)
+{
+	return ibv_poll_cq(conn->recv_cq, nwc, wc);
 }
 
 rdma_t *new_rdma()
 {
-	static rdma_t r = { .init = __impl_init,
-			    .exit = __impl_exit,
-			    .regmr = __impl_regmr,
-			    .setmr = __impl_setmr,
-			    .server = __impl_server,
-			    .listen = __impl_listen,
-			    .accept = __impl_accept,
-			    .client = __impl_client,
-			    .connect = __impl_connect,
-			    .connect_qp = __impl_connect_qp,
-			    .send = __impl_send,
-			    .recv = __impl_recv,
-			    .poll = __impl_poll,
-			    .destroy_conn = __impl_destroy_conn,
-			    .destroy_accp = __impl_destroy_accp,
-			    .is_connected = __impl_is_connected,
-			    .local_addr = __impl_localinfo,
-			    .remote_addr = __impl_peerinfo };
+	static rdma_t r = {
+		.init = __impl_init,
+		.exit = __impl_exit,
+		.regmr = __impl_regmr,
+		.setmr = __impl_setmr,
+		.server = __impl_server,
+		.listen = __impl_listen,
+		.accept = __impl_accept,
+		.client = __impl_client,
+		.connect = __impl_connect,
+		.connect_qp = __impl_connect_qp,
+		.send = __impl_send,
+		.recv = __impl_recv,
+		.poll_send = __impl_poll_send,
+		.poll_recv = __impl_poll_recv,
+		.destroy_conn = __impl_destroy_conn,
+		.destroy_accp = __impl_destroy_accp,
+		.local_addr = __impl_localinfo,
+		.remote_addr = __impl_peerinfo,
+	};
 
 	return &r;
 }

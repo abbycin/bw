@@ -1,12 +1,13 @@
 CC = gcc
-CFLAGS = -std=gnu99 -Wall -Wextra -O2 -g
+CFLAGS = -std=gnu11 -D_GNU_SOURCE -Wall -Wextra -O2 -g 
+LDFLAGS = -libverbs -lrdmacm -pthread
 OBJS = $(patsubst %.c,%.o, $(wildcard *.c))
 
 all: bw
 
 bw: $(OBJS)
 	@printf  "\e[33mlink %s\e[0m\n" $@
-	@$(CC) $(CFLAGS) -o $@ $^ -libverbs
+	@$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 %.o: %.c
 	@printf "\e[32mbuild %s\e[0m\n" $^
@@ -18,5 +19,5 @@ slow: all
 
 .PHONY: clean
 clean:
-	@rm -f *.a *.o *.gch bw a.out
+	@rm -f *.a *.o *.gch bw a.out core.*
 
