@@ -120,6 +120,7 @@ tx: 260527063040, rx: 256318402560, bw: 44809.27MB/s iops: 11471173
 #define min(x, y) ((x) > (y) ? (y) : (x))
 #define tid() ((int)syscall(SYS_gettid))
 static pthread_spinlock_t g_lk;
+static bool g_verbose;
 
 #define debug(f, ...)                                                          \
 	do {                                                                   \
@@ -518,10 +519,11 @@ static void *client_func(void *arg)
 
 	head = msg->head;
 	while (head) {
-		debug("conn %p ldev %d rdev %d",
-		      head,
-		      head->con->dev,
-		      head->con->rdev);
+		if (g_verbose)
+			debug("conn %p ldev %d rdev %d",
+			      head,
+			      head->con->dev,
+			      head->con->rdev);
 		rc = client_recv(rdma, head, size);
 		if (rc)
 			msg->head = remove_node(msg->head, &head);
@@ -769,7 +771,7 @@ int main(int argc, char *argv[])
 		.ip = { 0, 0 },
 	};
 
-	while ((opt = getopt(argc, argv, "s:d:c:n:p:i:SCh")) != -1) {
+	while ((opt = getopt(argc, argv, "s:d:c:n:p:i:SCVh")) != -1) {
 		switch (opt) {
 		case 's':
 			param.size = strtol(optarg, &endp, 10);
@@ -782,6 +784,9 @@ int main(int argc, char *argv[])
 			break;
 		case 'S':
 			param.use_seq = true;
+			break;
+		case 'V':
+			g_verbose = true;
 			break;
 		case 'd':
 			param.dur = strtol(optarg, &endp, 10);
